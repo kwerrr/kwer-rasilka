@@ -1,0 +1,565 @@
+"""
+╔══════════════════════════════════════════════════════════════════╗
+║         РАССЫЛКА ОТ ЛИЦА АККАУНТА — управление через бота        ║
+║  Зависимости:  pip install pyrogram tgcrypto aiogram python-dotenv ║
+╚══════════════════════════════════════════════════════════════════╝
+
+Настройка:
+  1. Получите API_ID и API_HASH на https://my.telegram.org
+  2. Получите BOT_TOKEN от @BotFather
+  3. Заполните константы ниже (или используйте .env)
+  4. При первом запуске Pyrogram попросит войти в аккаунт (номер + код)
+  5. Сессия сохранится в файл my_account.session
+
+Форматы файла получателей (.txt):
+  @username
+  123456789
+  -1001234567890
+  https://t.me/somegroup
+"""
+
+import asyncio
+import logging
+import re
+import os
+import uuid
+from typing import Union
+
+# ── pip install pyrogram tgcrypto aiogram python-dotenv ──────────────────────
+try:
+    from pyrogram import Client as PyroClient
+    from pyrogram.errors import (
+        FloodWait, UserPrivacyRestricted, PeerIdInvalid,
+        UsernameNotOccupied, ChatWriteForbidden, UserBannedInChannel,
+        InputUserDeactivated, UserIsBlocked
+    )
+except ImportError:
+    raise SystemExit("Установите pyrogram и tgcrypto:\n  pip install pyrogram tgcrypto")
+
+try:
+    from aiogram import Bot, Dispatcher, F
+    from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+    from aiogram.filters import CommandStart
+    from aiogram.fsm.context import FSMContext
+    from aiogram.fsm.state import State, StatesGroup
+    from aiogram.fsm.storage.memory import MemoryStorage
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+except ImportError:
+    raise SystemExit("Установите aiogram:\n  pip install aiogram")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  КОНФИГУРАЦИЯ  — замените значения или создайте .env файл
+# ═══════════════════════════════════════════════════════════════════════════════
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+API_ID       = int(os.getenv("API_ID", "0"))          # https://my.telegram.org
+API_HASH     = os.getenv("API_HASH", "YOUR_API_HASH")  # https://my.telegram.org
+BOT_TOKEN    = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN")
+SESSION_NAME = os.getenv("SESSION_NAME", "my_account")
+# ID вашего Telegram-аккаунта (узнать можно у @userinfobot)
+OWNER_ID     = int(os.getenv("OWNER_ID", "0"))
+
+if API_ID == 0 or API_HASH == "YOUR_API_HASH":
+    raise SystemExit(
+        "Заполните API_ID и API_HASH!\n"
+        "Получить: https://my.telegram.org/apps"
+    )
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  ЛОГИРОВАНИЕ
+# ═══════════════════════════════════════════════════════════════════════════════
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+log = logging.getLogger("broadcast")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  FSM СОСТОЯНИЯ
+# ═══════════════════════════════════════════════════════════════════════════════
+class S(StatesGroup):
+    text          = State()
+    file_groups   = State()
+    file_users    = State()
+    cooldown      = State()
+    cooldown_inp  = State()
+    interval      = State()
+    interval_inp  = State()
+    confirm       = State()
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  УТИЛИТЫ — парсинг файлов
+# ═══════════════════════════════════════════════════════════════════════════════
+def parse_targets(raw: str) -> list:
+    """Парсит @username, числовые ID и t.me/-ссылки из многострочного текста."""
+    result = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        # t.me/username
+        m = re.search(r"t\.me/([a-zA-Z0-9_]+)", line)
+        if m:
+            result.append("@" + m.group(1))
+            continue
+        # числовой ID (положительный или отрицательный)
+        if re.match(r"^-?\d+$", line):
+            result.append(int(line))
+            continue
+        # @username или username
+        if re.match(r"^@?[a-zA-Z0-9_]{4,32}$", line):
+            result.append(line if line.startswith("@") else "@" + line)
+    return result
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  КЛАВИАТУРЫ
+# ═══════════════════════════════════════════════════════════════════════════════
+def kb_main() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.row(InlineKeyboardButton(text="📨 Новая рассылка",      callback_data="new"))
+    b.row(InlineKeyboardButton(text="📋 Активные задачи",     callback_data="tasks"))
+    return b.as_markup()
+
+def kb_type() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.row(InlineKeyboardButton(text="👥 Группы / каналы",     callback_data="t_groups"))
+    b.row(InlineKeyboardButton(text="💬 Личные сообщения",    callback_data="t_dm"))
+    b.row(InlineKeyboardButton(text="◀️ Назад",               callback_data="main"))
+    return b.as_markup()
+
+def kb_cooldown() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    opts = [("0 сек",0),("30 сек",30),("1 мин",60),("5 мин",300),
+            ("10 мин",600),("30 мин",1800),("1 час",3600),("6 ч",21600)]
+    btns = [InlineKeyboardButton(text=l, callback_data=f"cd_{v}") for l,v in opts]
+    for i in range(0, len(btns), 2):
+        b.row(*btns[i:i+2])
+    b.row(InlineKeyboardButton(text="✏️ Своё",  callback_data="cd_custom"))
+    b.row(InlineKeyboardButton(text="◀️ Назад", callback_data="main"))
+    return b.as_markup()
+
+def kb_interval() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    opts = [("1 сек",1),("3 сек",3),("5 сек",5),("10 сек",10),
+            ("30 сек",30),("1 мин",60),("5 мин",300),("10 мин",600)]
+    btns = [InlineKeyboardButton(text=l, callback_data=f"iv_{v}") for l,v in opts]
+    for i in range(0, len(btns), 2):
+        b.row(*btns[i:i+2])
+    b.row(InlineKeyboardButton(text="✏️ Своё",  callback_data="iv_custom"))
+    b.row(InlineKeyboardButton(text="◀️ Назад", callback_data="main"))
+    return b.as_markup()
+
+def kb_confirm() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.row(
+        InlineKeyboardButton(text="✅ Запустить", callback_data="go"),
+        InlineKeyboardButton(text="❌ Отмена",    callback_data="cancel"),
+    )
+    return b.as_markup()
+
+def kb_back(target="main") -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.row(InlineKeyboardButton(text="◀️ Назад", callback_data=target))
+    return b.as_markup()
+
+def kb_tasks(tasks: dict) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    for tid, t in tasks.items():
+        sid = tid[:8]
+        if t["running"]:
+            b.row(InlineKeyboardButton(text=f"⏸ Стоп  [{sid}]",   callback_data=f"stop_{tid}"))
+        else:
+            b.row(InlineKeyboardButton(text=f"▶️ Старт [{sid}]",   callback_data=f"res_{tid}"))
+        b.row(InlineKeyboardButton(text=f"🗑 Удалить [{sid}]",     callback_data=f"del_{tid}"))
+    b.row(InlineKeyboardButton(text="◀️ Назад", callback_data="main"))
+    return b.as_markup()
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  МЕНЕДЖЕР РАССЫЛКИ (Pyrogram)
+# ═══════════════════════════════════════════════════════════════════════════════
+class BroadcastManager:
+    def __init__(self, pyro: PyroClient, aiogram_bot: Bot):
+        self.pyro = pyro
+        self.bot  = aiogram_bot
+        self._tasks: dict[str, dict]               = {}
+        self._jobs:  dict[str, asyncio.Task]       = {}
+
+    def get_tasks(self) -> dict:
+        return self._tasks
+
+    # ── создание задачи ────────────────────────────────────────────────────
+    async def create(self, *, btype, targets, text, cooldown, interval, notify_id) -> str:
+        tid = str(uuid.uuid4())
+        self._tasks[tid] = dict(
+            type=btype, targets=list(targets), remaining=list(targets),
+            text=text, cooldown=cooldown, interval=interval,
+            notify_id=notify_id, sent=0, failed=0,
+            total=len(targets), running=True,
+        )
+        self._jobs[tid] = asyncio.create_task(self._run(tid))
+        return tid
+
+    # ── основной цикл ──────────────────────────────────────────────────────
+    async def _run(self, tid: str):
+        t = self._tasks[tid]
+        log.info(f"[{tid[:8]}] Start — {t['total']} targets, interval={t['interval']}s")
+
+        while t["remaining"] and t["running"]:
+            target = t["remaining"][0]
+            ok = await self._send(t["text"], target)
+            t["remaining"].pop(0)
+            if ok:
+                t["sent"] += 1
+            else:
+                t["failed"] += 1
+
+            if t["remaining"] and t["running"]:
+                await asyncio.sleep(t["interval"])
+
+        t["running"] = False
+        log.info(f"[{tid[:8]}] Done — sent={t['sent']} failed={t['failed']}")
+
+        try:
+            await self.bot.send_message(
+                t["notify_id"],
+                f"✅ <b>Рассылка завершена</b>\n\n"
+                f"🆔 <code>{tid}</code>\n"
+                f"📤 Отправлено: <b>{t['sent']}</b>\n"
+                f"❌ Ошибок: <b>{t['failed']}</b>\n"
+                f"📊 Всего: <b>{t['total']}</b>",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+
+    # ── отправка одного сообщения через аккаунт ────────────────────────────
+    async def _send(self, text: str, target) -> bool:
+        try:
+            await self.pyro.send_message(target, text)
+            return True
+
+        except FloodWait as e:
+            log.warning(f"FloodWait {e.value}s for {target}")
+            await asyncio.sleep(e.value)
+            return await self._send(text, target)   # повтор после ожидания
+
+        except (UserPrivacyRestricted, UserIsBlocked, InputUserDeactivated):
+            log.info(f"Skip {target}: privacy/blocked/deactivated")
+            return False
+
+        except (PeerIdInvalid, UsernameNotOccupied):
+            log.warning(f"Skip {target}: invalid peer")
+            return False
+
+        except (ChatWriteForbidden, UserBannedInChannel):
+            log.warning(f"Skip {target}: write forbidden")
+            return False
+
+        except Exception as e:
+            log.error(f"Error sending to {target}: {e}")
+            return False
+
+    # ── управление задачами ────────────────────────────────────────────────
+    def stop(self, tid: str):
+        if tid in self._tasks:
+            self._tasks[tid]["running"] = False
+        if tid in self._jobs:
+            self._jobs[tid].cancel()
+
+    async def resume(self, tid: str):
+        t = self._tasks.get(tid)
+        if not t or t["running"]:
+            return
+        # Пересчитываем оставшихся (со смещением по cooldown — просто продолжаем с места)
+        t["remaining"] = t["targets"][t["sent"] + t["failed"]:]
+        t["running"] = True
+        self._jobs[tid] = asyncio.create_task(self._run(tid))
+
+    def delete(self, tid: str):
+        self.stop(tid)
+        self._tasks.pop(tid, None)
+        self._jobs.pop(tid, None)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  AIOGRAM — ХЭНДЛЕРЫ
+# ═══════════════════════════════════════════════════════════════════════════════
+def only_owner(uid: int) -> bool:
+    """Пропускаем только владельца (если OWNER_ID задан)."""
+    if OWNER_ID == 0:
+        return True   # без ограничений
+    return uid == OWNER_ID
+
+def register_handlers(dp: Dispatcher, manager: BroadcastManager, aiogram_bot: Bot):
+
+    # ── /start ────────────────────────────────────────────────────────────
+    @dp.message(CommandStart())
+    async def cmd_start(msg: Message, state: FSMContext):
+        if not only_owner(msg.from_user.id):
+            return await msg.answer("⛔ Нет доступа.")
+        await state.clear()
+        await msg.answer(
+            "📢 <b>Рассылка от лица аккаунта</b>\n\nВыберите действие:",
+            parse_mode="HTML", reply_markup=kb_main()
+        )
+
+    # ── главное меню ──────────────────────────────────────────────────────
+    @dp.callback_query(F.data == "main")
+    async def cb_main(cb: CallbackQuery, state: FSMContext):
+        await state.clear()
+        await cb.message.edit_text(
+            "📢 <b>Рассылка от лица аккаунта</b>\n\nВыберите действие:",
+            parse_mode="HTML", reply_markup=kb_main()
+        )
+
+    @dp.callback_query(F.data == "new")
+    async def cb_new(cb: CallbackQuery, state: FSMContext):
+        await state.clear()
+        await cb.message.edit_text(
+            "📨 <b>Новая рассылка</b>\n\nВыберите тип:",
+            parse_mode="HTML", reply_markup=kb_type()
+        )
+
+    # ── выбор типа ────────────────────────────────────────────────────────
+    @dp.callback_query(F.data.in_({"t_groups", "t_dm"}))
+    async def cb_type(cb: CallbackQuery, state: FSMContext):
+        btype = "groups" if cb.data == "t_groups" else "dm"
+        await state.update_data(btype=btype)
+        label = "группы/каналы" if btype == "groups" else "личные сообщения"
+        await state.set_state(S.text)
+        await cb.message.edit_text(
+            f"✉️ <b>Рассылка → {label}</b>\n\n"
+            "Введите текст сообщения.\n"
+            "Поддерживается Markdown: **жирный**, __курсив__, `код`",
+            parse_mode="HTML", reply_markup=kb_back("new")
+        )
+
+    # ── текст сообщения ───────────────────────────────────────────────────
+    @dp.message(S.text)
+    async def get_text(msg: Message, state: FSMContext):
+        await state.update_data(text=msg.text or msg.caption or "")
+        data = await state.get_data()
+        next_state = S.file_groups if data["btype"] == "groups" else S.file_users
+        await state.set_state(next_state)
+
+        hint = (
+            "• @username\n• числовой ID (-1001234567890)\n• https://t.me/group"
+            if data["btype"] == "groups" else
+            "• @username\n• числовой ID пользователя (123456789)"
+        )
+        await msg.answer(
+            f"📁 <b>Загрузите список получателей</b>\n\n"
+            f"Отправьте <code>.txt</code> файл <b>или</b> вставьте список прямо сюда.\n\n"
+            f"Формат (каждый с новой строки):\n{hint}",
+            parse_mode="HTML", reply_markup=kb_back("new")
+        )
+
+    # ── файл / текст с получателями для групп ────────────────────────────
+    @dp.message(S.file_groups, F.document)
+    async def get_groups_doc(msg: Message, state: FSMContext):
+        await _load_doc(msg, state)
+
+    @dp.message(S.file_groups)
+    async def get_groups_text(msg: Message, state: FSMContext):
+        await _load_text(msg, state)
+
+    # ── файл / текст с получателями для ЛС ───────────────────────────────
+    @dp.message(S.file_users, F.document)
+    async def get_users_doc(msg: Message, state: FSMContext):
+        await _load_doc(msg, state)
+
+    @dp.message(S.file_users)
+    async def get_users_text(msg: Message, state: FSMContext):
+        await _load_text(msg, state)
+
+    # ── вспомогательные функции загрузки ──────────────────────────────────
+    async def _load_doc(msg: Message, state: FSMContext):
+        if not msg.document.file_name.endswith(".txt"):
+            return await msg.answer("⚠️ Нужен <code>.txt</code> файл.", parse_mode="HTML")
+        f = await aiogram_bot.get_file(msg.document.file_id)
+        raw = (await aiogram_bot.download_file(f.file_path)).read().decode("utf-8")
+        targets = parse_targets(raw)
+        if not targets:
+            return await msg.answer("⚠️ Файл пуст или формат не распознан.")
+        await state.update_data(targets=targets)
+        await _ask_cooldown(msg, state, len(targets))
+
+    async def _load_text(msg: Message, state: FSMContext):
+        targets = parse_targets(msg.text or "")
+        if not targets:
+            return await msg.answer("⚠️ Получатели не найдены. Проверьте формат.")
+        await state.update_data(targets=targets)
+        await _ask_cooldown(msg, state, len(targets))
+
+    async def _ask_cooldown(msg: Message, state: FSMContext, count: int):
+        await state.set_state(S.cooldown)
+        await msg.answer(
+            f"✅ Загружено <b>{count}</b> получателей.\n\n"
+            "⏱ <b>Кулдаун</b> — задержка между повторными отправками (при возобновлении задачи):",
+            parse_mode="HTML", reply_markup=kb_cooldown()
+        )
+
+    # ── кулдаун ───────────────────────────────────────────────────────────
+    @dp.callback_query(S.cooldown, F.data.startswith("cd_"))
+    async def cb_cooldown(cb: CallbackQuery, state: FSMContext):
+        if cb.data == "cd_custom":
+            await state.set_state(S.cooldown_inp)
+            return await cb.message.edit_text(
+                "✏️ Введите кулдаун в секундах:", reply_markup=kb_back("new")
+            )
+        val = int(cb.data.split("_")[1])
+        await state.update_data(cooldown=val)
+        await state.set_state(S.interval)
+        await cb.message.edit_text(
+            f"✅ Кулдаун: <b>{val} сек</b>\n\n"
+            "⏳ <b>Интервал</b> — пауза между отправкой каждому получателю:",
+            parse_mode="HTML", reply_markup=kb_interval()
+        )
+
+    @dp.message(S.cooldown_inp)
+    async def cooldown_inp(msg: Message, state: FSMContext):
+        try:
+            val = int(msg.text.strip()); assert val >= 0
+        except:
+            return await msg.answer("⚠️ Введите целое число ≥ 0.")
+        await state.update_data(cooldown=val)
+        await state.set_state(S.interval)
+        await msg.answer(
+            f"✅ Кулдаун: <b>{val} сек</b>\n\n"
+            "⏳ <b>Интервал</b> — пауза между отправкой каждому получателю:",
+            parse_mode="HTML", reply_markup=kb_interval()
+        )
+
+    # ── интервал ──────────────────────────────────────────────────────────
+    @dp.callback_query(S.interval, F.data.startswith("iv_"))
+    async def cb_interval(cb: CallbackQuery, state: FSMContext):
+        if cb.data == "iv_custom":
+            await state.set_state(S.interval_inp)
+            return await cb.message.edit_text(
+                "✏️ Введите интервал в секундах:", reply_markup=kb_back("new")
+            )
+        val = int(cb.data.split("_")[1])
+        await state.update_data(interval=val)
+        await _show_confirm(cb.message, state)
+
+    @dp.message(S.interval_inp)
+    async def interval_inp(msg: Message, state: FSMContext):
+        try:
+            val = int(msg.text.strip()); assert val >= 0
+        except:
+            return await msg.answer("⚠️ Введите целое число ≥ 0.")
+        await state.update_data(interval=val)
+        await _show_confirm(msg, state)
+
+    # ── подтверждение ─────────────────────────────────────────────────────
+    async def _show_confirm(msg_or_cb, state: FSMContext):
+        d = await state.get_data()
+        preview = d["text"][:120] + ("…" if len(d["text"]) > 120 else "")
+        label = "Группы/каналы" if d["btype"] == "groups" else "Личные сообщения"
+        txt = (
+            "📋 <b>Подтверждение рассылки</b>\n\n"
+            f"👤 Отправитель: <b>ваш аккаунт</b>\n"
+            f"📌 Тип: <b>{label}</b>\n"
+            f"👥 Получателей: <b>{len(d['targets'])}</b>\n"
+            f"⏱ Кулдаун: <b>{d['cooldown']} сек</b>\n"
+            f"⏳ Интервал: <b>{d['interval']} сек</b>\n\n"
+            f"💬 Текст:\n<i>{preview}</i>"
+        )
+        await state.set_state(S.confirm)
+        try:
+            await msg_or_cb.edit_text(txt, parse_mode="HTML", reply_markup=kb_confirm())
+        except:
+            await msg_or_cb.answer(txt, parse_mode="HTML", reply_markup=kb_confirm())
+
+    @dp.callback_query(S.confirm, F.data == "go")
+    async def cb_go(cb: CallbackQuery, state: FSMContext):
+        d = await state.get_data()
+        await state.clear()
+        tid = await manager.create(
+            btype=d["btype"], targets=d["targets"], text=d["text"],
+            cooldown=d["cooldown"], interval=d["interval"],
+            notify_id=cb.from_user.id
+        )
+        await cb.message.edit_text(
+            f"🚀 <b>Рассылка запущена!</b>\n\n"
+            f"🆔 ID: <code>{tid}</code>\n"
+            f"👥 Получателей: <b>{len(d['targets'])}</b>\n\n"
+            "Следите за прогрессом в «Активных задачах».",
+            parse_mode="HTML", reply_markup=kb_back("main")
+        )
+
+    @dp.callback_query(S.confirm, F.data == "cancel")
+    async def cb_cancel(cb: CallbackQuery, state: FSMContext):
+        await state.clear()
+        await cb.message.edit_text("❌ Рассылка отменена.", reply_markup=kb_main())
+
+    # ── управление задачами ───────────────────────────────────────────────
+    async def _render_tasks(cb: CallbackQuery):
+        tasks = manager.get_tasks()
+        if not tasks:
+            return await cb.message.edit_text(
+                "📋 <b>Активные задачи</b>\n\nЗадач нет.",
+                parse_mode="HTML", reply_markup=kb_back("main")
+            )
+        lines = ["📋 <b>Активные задачи:</b>\n"]
+        for tid, t in tasks.items():
+            status = "▶️ Активна" if t["running"] else "⏸ Остановлена"
+            lines.append(
+                f"<code>{tid[:8]}</code> | {status}\n"
+                f"  {'Группы' if t['type']=='groups' else 'ЛС'} | "
+                f"{t['sent']}/{t['total']} | "
+                f"кд {t['cooldown']}с | ин {t['interval']}с\n"
+            )
+        await cb.message.edit_text(
+            "\n".join(lines), parse_mode="HTML", reply_markup=kb_tasks(tasks)
+        )
+
+    @dp.callback_query(F.data == "tasks")
+    async def cb_tasks(cb: CallbackQuery):
+        await _render_tasks(cb)
+
+    @dp.callback_query(F.data.startswith("stop_"))
+    async def cb_stop(cb: CallbackQuery):
+        manager.stop(cb.data[5:])
+        await cb.answer("⏸ Остановлена")
+        await _render_tasks(cb)
+
+    @dp.callback_query(F.data.startswith("res_"))
+    async def cb_res(cb: CallbackQuery):
+        await manager.resume(cb.data[4:])
+        await cb.answer("▶️ Возобновлена")
+        await _render_tasks(cb)
+
+    @dp.callback_query(F.data.startswith("del_"))
+    async def cb_del(cb: CallbackQuery):
+        manager.delete(cb.data[4:])
+        await cb.answer("🗑 Удалена")
+        await _render_tasks(cb)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  ТОЧКА ВХОДА
+# ═══════════════════════════════════════════════════════════════════════════════
+async def main():
+    # Запускаем Pyrogram (авторизация аккаунта)
+    pyro = PyroClient(SESSION_NAME, api_id=API_ID, api_hash=API_HASH)
+    await pyro.start()
+    me = await pyro.get_me()
+    log.info(f"Pyrogram: вошли как {me.first_name} (@{me.username})")
+
+    # Запускаем aiogram-бота для управления
+    aiogram_bot = Bot(token=BOT_TOKEN)
+    dp = Dispatcher(storage=MemoryStorage())
+    manager = BroadcastManager(pyro, aiogram_bot)
+    register_handlers(dp, manager, aiogram_bot)
+
+    log.info("Aiogram бот запущен. Управляйте через Telegram.")
+    try:
+        await dp.start_polling(aiogram_bot)
+    finally:
+        await pyro.stop()
+
+if __name__ == "__main__":
+    asyncio.run(main())
